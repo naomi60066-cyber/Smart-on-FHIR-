@@ -1,324 +1,528 @@
-import os, json, tempfile, subprocess, sys
-import streamlit as st
-import requests
-import streamlit.components.v1 as components
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-from shock_rate import predict_shock
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <title>SHIELD HRV Risk Prediction System</title>
 
-# =========================================
-# UI Header
-# =========================================
-st.title("SHIELD")
-st.caption("HRV Sepsis Early Warning System Powerd by AI")
+  <script src="https://cdn.jsdelivr.net/npm/fhirclient/build/fhir-client.min.js"></script>
 
-risk_placeholder = st.empty()
-ecg_hrv_placeholder = st.empty()
+  <style>
+    * {
+      box-sizing: border-box;
+    }
 
-qp = st.experimental_get_query_params()
-token_q = qp.get("token", [""])[0]
-obs_q   = qp.get("obs", [""])[0]
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #f4f7fb;
+      color: #0f172a;
+    }
 
-# =========================================
-# Check Models
-# =========================================
-@st.cache_resource
-def _check_models_exist():
-    assert os.path.exists("models/model_focalloss.h5"), "Missing models/model_focalloss.h5"
-    assert os.path.exists("models/xgb_model.json"), "Missing models/xgb_model.json"
+    .page {
+      display: flex;
+      min-height: 100vh;
+    }
 
-_check_models_exist()
+    .sidebar {
+      width: 260px;
+      background: linear-gradient(180deg, #0f2a44, #061827);
+      color: white;
+      padding: 28px 22px;
+    }
 
-# =========================================
-# FHIR Fetch
-# =========================================
-def fetch_observation(token, obs_url):
-    r = requests.get(
-        obs_url,
-        headers={"Authorization": f"Bearer {token}"},
-        verify=False,
-        timeout=20
-    )
-    r.raise_for_status()
-    return r.json()
+    .brand {
+      font-size: 32px;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
 
-# =========================================
-# Patient Data Placeholder
-# =========================================
-st.markdown("---")
-patient_data_placeholder = st.empty()
-with patient_data_placeholder.container():
-    st.expander("Patient Data (Click to Expand)", expanded=False)
+    .subtitle {
+      font-size: 14px;
+      color: #cbd5e1;
+      margin-bottom: 36px;
+    }
 
-# =========================================
-# Token & Observation URL
-# =========================================
-token = st.text_input("Token", value=token_q, type="password")
-obs_url = st.text_input("Observation URL", value=obs_q)
+    .nav-item {
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin-bottom: 10px;
+      color: #e2e8f0;
+    }
 
-# =========================================
-# Reset cache if token/obs_url changed (MINIMAL but IMPORTANT)
-# =========================================
-current_key = f"{token}||{obs_url}"
-if "analysis_key" not in st.session_state:
-    st.session_state.analysis_key = ""
-if st.session_state.analysis_key != current_key:
-    # 清掉舊資料，避免換病人仍顯示舊結果
-    for k in [
-        "analysis_done", "obs", "ecg_signal", "hrv_df", "preds",
-        "risk_pct", "risk_label", "risk_color", "hr_signal"
-    ]:
-        if k in st.session_state:
-            del st.session_state[k]
-    st.session_state.analysis_key = current_key
+    .nav-item.active {
+      background: #2563eb;
+      color: white;
+      font-weight: 700;
+    }
 
-# =========================================
-# Auto Run Logic
-# =========================================
-if token and obs_url:
+    .about {
+      margin-top: 80px;
+      padding: 16px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 13px;
+      color: #dbeafe;
+      line-height: 1.6;
+    }
 
-    # -----------------------------------------
-    # Heavy pipeline: run ONCE
-    # -----------------------------------------
-    if "analysis_done" not in st.session_state:
-        try:
-            with st.spinner("Fetching Patient Data..."):
-                obs = fetch_observation(token, obs_url)
+    .main {
+      flex: 1;
+      padding: 30px;
+    }
 
-            # 先把 patient JSON 顯示出來
-            st.session_state.obs = obs
+    .header {
+      background: white;
+      padding: 24px 28px;
+      border-radius: 20px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+      margin-bottom: 24px;
+    }
 
-            with tempfile.TemporaryDirectory() as td:
-                obs_path = os.path.join(td, "obs.json")
-                ecg_csv  = os.path.join(td, "ECG_5min.csv")
-                h0_csv   = os.path.join(td, "h0.csv")
+    .header h1 {
+      margin: 0;
+      font-size: 30px;
+    }
 
-                with open(obs_path, "w") as f:
-                    json.dump(obs, f)
+    .header p {
+      margin: 8px 0 0;
+      color: #475569;
+      font-size: 16px;
+    }
 
-                # ----- Parse ECG -----
-                with st.spinner("Parsing ECG..."):
-                    proc = subprocess.run(
-                        [sys.executable, "parse_fhir_ecg_to_csv.py", obs_path, ecg_csv],
-                        capture_output=True,
-                        text=True
-                    )
-                    if proc.returncode != 0:
-                        raise RuntimeError(proc.stderr or "parse_fhir_ecg_to_csv.py failed")
+    .status-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      background: #22c55e;
+      border-radius: 50%;
+      margin: 0 8px 0 16px;
+    }
 
-                    if not os.path.exists(ecg_csv):
-                        raise RuntimeError("ECG CSV not created by parse_fhir_ecg_to_csv.py")
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+      margin-bottom: 22px;
+    }
 
-                    ecg_df = pd.read_csv(ecg_csv, header=None)
-                    ecg_signal = (
-                        pd.to_numeric(ecg_df.iloc[:, 0], errors="coerce")
-                        .dropna()
-                        .to_numpy(dtype=float)
-                        .ravel()
-                    )
-                    if ecg_signal.size == 0:
-                        raise RuntimeError("ECG signal is empty after parsing")
+    .card, .panel, .metrics {
+      background: white;
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
 
-                # ----- Generate HRV Features -----
-                with st.spinner("Generating HRV features..."):
-                    proc = subprocess.run(
-                        [sys.executable, "generate_HRV_10_features.py", ecg_csv, h0_csv],
-                        capture_output=True,
-                        text=True
-                    )
-                    if proc.returncode != 0:
-                        raise RuntimeError(proc.stderr or "generate_HRV_10_features.py failed")
+    .card h3, .panel h3, .metrics h3 {
+      margin-top: 0;
+      font-size: 16px;
+    }
 
-                    # 從 stdout 讀回 HRV dataframe（你原本做法）
-                    h0_json = proc.stdout.splitlines()[-1]
-                    hrv_df = pd.read_json(h0_json, orient="records")
+    .value {
+      font-size: 24px;
+      font-weight: 800;
+      margin-top: 12px;
+    }
 
-                # ----- Predict Shock Risk -----
-                with st.spinner("Predicting shock risk..."):
-                    preds = predict_shock(h0_csv)
+    .success {
+      color: #16a34a;
+    }
 
-            # ===== 存進 session_state（關鍵）=====
-            st.session_state.ecg_signal = ecg_signal
-            st.session_state.hrv_df = hrv_df
-            st.session_state.preds = preds
+    .warning {
+      color: #f59e0b;
+    }
 
-            # Risk 衍生值也只算一次（避免 slider 以後再算）
-            risk_pct = round(float(preds[0]) * 100, 2)
-            if risk_pct < 20:
-                risk_label = "LOW RISK"
-                risk_color = "#2ecc71"
-            elif risk_pct < 40:
-                risk_label = "MODERATE RISK"
-                risk_color = "#f39c12"
-            else:
-                risk_label = "HIGH RISK"
-                risk_color = "#e74c3c"
+    .muted {
+      color: #64748b;
+      font-size: 14px;
+    }
 
-            st.session_state.risk_pct = risk_pct
-            st.session_state.risk_label = risk_label
-            st.session_state.risk_color = risk_color
+    .dashboard {
+      display: grid;
+      grid-template-columns: 1fr 1.5fr;
+      gap: 18px;
+      margin-bottom: 22px;
+    }
 
-            st.session_state.analysis_done = True
-            st.success("Done")
+    .risk-box {
+      text-align: center;
+      padding: 28px 0;
+    }
 
-        except Exception as e:
-            # 讓你不會「看起來沒動作」
-            st.error(f"Pipeline failed: {e}")
-            st.stop()
+    .risk-level {
+      font-size: 42px;
+      font-weight: 900;
+      color: #f59e0b;
+      margin: 20px 0 8px;
+    }
 
-    # -----------------------------------------
-    # Always show Patient Data (no heavy rerun)
-    # -----------------------------------------
-    with patient_data_placeholder.container():
-        with st.expander("Patient Data (Click to Expand)", expanded=False):
-            st.json(st.session_state.get("obs", {}))
+    .score {
+      display: inline-block;
+      background: #eff6ff;
+      color: #1d4ed8;
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 14px;
+      margin-bottom: 16px;
+    }
 
-    # -----------------------------------------
-    # Risk Visualization (values are fixed)
-    # -----------------------------------------
-    risk_pct = st.session_state.risk_pct
-    risk_label = st.session_state.risk_label
-    risk_color = st.session_state.risk_color
+    .recommendation {
+      text-align: left;
+      background: #f8fafc;
+      border-radius: 14px;
+      padding: 16px;
+      line-height: 1.6;
+      font-size: 14px;
+    }
 
-    with risk_placeholder.container():
-        pie_col, value_col = st.columns([1, 2], gap="large")
+    .chart-placeholder {
+      height: 260px;
+      border-radius: 16px;
+      background:
+        linear-gradient(180deg, rgba(37,99,235,0.08), rgba(37,99,235,0.01)),
+        repeating-linear-gradient(
+          to bottom,
+          transparent,
+          transparent 48px,
+          #e2e8f0 49px
+        );
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #64748b;
+      font-weight: 600;
+    }
 
-        with pie_col:
-            components.html(
-                f"""
-                <style>
-                .pie {{
-                    width: 120px;
-                    height: 120px;
-                    border-radius: 50%;
-                    background: conic-gradient(
-                        {risk_color} {risk_pct}%,
-                        #2c2c2c {risk_pct}% 100%
-                    );
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                }}
-                .pie-inner {{
-                    width: 70px;
-                    height: 70px;
-                    background: var(--secondary-background-color);
-                    border-radius: 50%;
-                }}
-                </style>
-                <div style="display:flex; justify-content:center;">
-                    <div class="pie">
-                        <div class="pie-inner"></div>
-                    </div>
-                </div>
-                """,
-                height=140,
-            )
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 14px;
+    }
 
-        with value_col:
-            st.markdown(
-                f"""
-                <div style="text-align:center; margin-top:18px;">
-                    <div style="font-size:42px; font-weight:800;">
-                        {risk_pct:.2f}%
-                    </div>
-                    <div style="font-size:20px; font-weight:700; color:{risk_color};">
-                        {risk_label}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    .metric {
+      background: #f8fafc;
+      border-radius: 16px;
+      padding: 16px;
+      text-align: center;
+    }
 
-    # =========================================
-    # ECG Input & HRV Features
-    # =========================================
-    with ecg_hrv_placeholder.container():
-        st.markdown("---")
-        st.subheader("ECG Input & HRV Features")
+    .metric-number {
+      font-size: 24px;
+      font-weight: 800;
+      margin: 8px 0;
+    }
 
-        # ----- HR Plot (slider only affects display) -----
-        try:
-            ecg_signal = st.session_state.ecg_signal
+    .tag {
+      display: inline-block;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: #dcfce7;
+      color: #15803d;
+    }
 
-            # 資料只準備一次（避免每次 slider 都 np.asarray）
-            if "hr_signal" not in st.session_state:
-                st.session_state.hr_signal = np.asarray(ecg_signal, dtype=float).ravel()
+    .tag.low {
+      background: #fee2e2;
+      color: #dc2626;
+    }
 
-            hr = st.session_state.hr_signal
-            n = len(hr)
-            x = np.arange(n)
+    .actions {
+      margin-top: 22px;
+      display: flex;
+      gap: 14px;
+    }
 
-            # idx = 750
-            # if 0 <= idx < n:
-            #     st.write(f"HR at index {idx}: {hr[idx]:.2f} bpm")
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 14px;
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
 
-            start_idx = st.slider(
-                "View start index",
-                min_value=0,
-                max_value=max(0, n - 500),
-                value=min(750, max(0, n - 50)),
-                step=1
-            )
+    button:hover {
+      background: #1d4ed8;
+    }
 
-            window_size = 500
-            end_idx = min(n, start_idx + window_size)
+    .secondary {
+      background: white;
+      color: #2563eb;
+      border: 1px solid #cbd5e1;
+    }
 
-            hr_win = hr[start_idx:end_idx]
-            x_win = x[start_idx:end_idx]
+    .secondary:hover {
+      background: #f8fafc;
+    }
 
-            ymin, ymax = float(hr_win.min()), float(hr_win.max())
-            if ymin == ymax:
-                ymin -= 1
-                ymax += 1
-            pad = 0.05 * (ymax - ymin)
+    details {
+      margin-top: 22px;
+      background: white;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
 
-            fig, ax = plt.subplots(figsize=(10, 3))
-            ax.plot(x_win, hr_win, linewidth=1)
-            ax.set_title("Heart Rate (index-based view of ECG)")
-            ax.set_xlabel("Index (Sample Rate:125Hz)")
-            ax.set_ylabel("Voltage (mV)")
-            ax.set_xlim(start_idx, end_idx)
-            ax.set_ylim(ymin - pad, ymax + pad)
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: #334155;
+    }
 
-            # if start_idx <= idx <= end_idx:
-            #     ax.axvline(x=idx, linestyle="--", alpha=0.5)
+    pre {
+      background: #0f172a;
+      color: #dbeafe;
+      padding: 18px;
+      border-radius: 14px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      margin-top: 16px;
+    }
 
-            ax.grid(alpha=0.3)
-            st.pyplot(fig)
-            plt.close(fig)
+    @media (max-width: 1100px) {
+      .cards, .metric-grid, .dashboard {
+        grid-template-columns: 1fr;
+      }
 
-        except Exception as e:
-            st.warning(f"Failed to plot HR: {e}")
+      .sidebar {
+        display: none;
+      }
+    }
+  </style>
+</head>
 
-        # ----- HRV Features (2 rows × 5 metrics) -----
-        try:
-            hrv_df = st.session_state.hrv_df
+<body>
+  <div class="page">
+    <aside class="sidebar">
+      <div class="brand">SHIELD</div>
+      <div class="subtitle">Clinical Decision Support</div>
 
-            st.markdown("Generated HRV Features")
+      <div class="nav-item active">Dashboard</div>
+      <div class="nav-item">Patient Context</div>
+      <div class="nav-item">Observations</div>
+      <div class="nav-item">HRV Analysis</div>
+      <div class="nav-item">FHIR Connection</div>
 
-            row = hrv_df.iloc[0]
-            feature_names = list(row.index)[:10]
-            feature_values = row.values[:10]
+      <div class="about">
+        <strong>About SHIELD</strong><br />
+        AI-powered HRV analysis system for clinical decision support.
+      </div>
+    </aside>
 
-            cols1 = st.columns(5)
-            for i in range(5):
-                with cols1[i]:
-                    st.metric(feature_names[i], f"{feature_values[i]:.3f}")
+    <main class="main">
+      <section class="header">
+        <h1>SHIELD HRV Risk Prediction System</h1>
+        <p>
+          SMART on FHIR Integration
+          <span class="status-dot"></span>
+          <span id="topStatus">Connecting...</span>
+        </p>
+      </section>
 
-            cols2 = st.columns(5)
-            for i in range(5, 10):
-                with cols2[i - 5]:
-                    st.metric(feature_names[i], f"{feature_values[i]:.3f}")
-            st.markdown(
-                "🔗 Reference of Features: "
-                "[https://doi.org/10.1016/j.bspc.2024.106854]"
-                "(https://doi.org/10.1016/j.bspc.2024.106854)"
-            )
+      <section class="cards">
+        <div class="card">
+          <h3>FHIR Connection</h3>
+          <div class="value success" id="connectionStatus">Connecting</div>
+          <p class="muted">SMART on FHIR Server</p>
+        </div>
 
-        except Exception as e:
-            st.warning(f"Failed to render HRV features: {e}")
+        <div class="card">
+          <h3>Patient Information</h3>
+          <p class="muted">Patient ID</p>
+          <div class="value" id="patientId">Waiting...</div>
+        </div>
 
-else:
-    st.info("Please enter Token and Observation URL to start calculation")
+        <div class="card">
+          <h3>Latest Observation</h3>
+          <p class="muted">Observation ID</p>
+          <div class="value" id="observationId">obs-HRV-003</div>
+        </div>
+
+        <div class="card">
+          <h3>Data Status</h3>
+          <div class="value" id="dataStatus">Loading</div>
+          <p class="muted">Observation(s)</p>
+        </div>
+      </section>
+
+      <section class="dashboard">
+        <div class="panel">
+          <h3>HRV Risk Assessment</h3>
+          <div class="risk-box">
+            <div class="risk-level">Moderate</div>
+            <div class="score">Risk Score: 0.62 / 1.00</div>
+
+            <div class="recommendation">
+              <strong>AI Clinical Recommendation</strong><br />
+              Patient shows moderate HRV risk. Continue monitoring and consider lifestyle assessment.
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>HRV Trends</h3>
+          <div class="chart-placeholder">
+            HRV / ECG trend preview
+          </div>
+        </div>
+      </section>
+
+      <section class="metrics">
+        <h3>HRV Key Metrics</h3>
+
+        <div class="metric-grid">
+          <div class="metric">
+            Heart Rate
+            <div class="metric-number">72</div>
+            <span class="tag">Normal</span>
+          </div>
+
+          <div class="metric">
+            SDNN
+            <div class="metric-number">45.6</div>
+            <span class="tag low">Low</span>
+          </div>
+
+          <div class="metric">
+            RMSSD
+            <div class="metric-number">28.3</div>
+            <span class="tag low">Low</span>
+          </div>
+
+          <div class="metric">
+            LF/HF Ratio
+            <div class="metric-number">2.35</div>
+            <span class="tag low">High</span>
+          </div>
+
+          <div class="metric">
+            pNN50
+            <div class="metric-number">12.5%</div>
+            <span class="tag low">Low</span>
+          </div>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button id="go">Start HRV Analysis</button>
+        <button class="secondary" onclick="location.reload()">Refresh Data</button>
+      </div>
+
+      <details>
+        <summary>Technical Details</summary>
+        <pre id="info">Initializing...</pre>
+      </details>
+    </main>
+  </div>
+
+  <script>
+    /**********************************************************
+     * 下游 SHIELD App
+     **********************************************************/
+    const SHINY_URL = "https://hrv-app-v4-0.onrender.com/";
+
+    // 指定的 Observation ID
+    const OBS_ID = "obs-HRV-003";
+
+    let accessToken = null;
+    let fhirBase = null;
+    let pid = null;
+    let OBS_URL = null;
+
+    function setError(message) {
+      document.getElementById("topStatus").textContent = "Error";
+      document.getElementById("connectionStatus").textContent = "Error";
+      document.getElementById("connectionStatus").className = "value warning";
+      document.getElementById("dataStatus").textContent = "Error";
+      document.getElementById("info").textContent = "❌ Error:\n" + message;
+    }
+
+    /**********************************************************
+     * SMART OAuth Ready
+     **********************************************************/
+    FHIR.oauth2.ready()
+      .then(client => {
+        accessToken = client.state.tokenResponse.access_token;
+        fhirBase = client.state.serverUrl;
+        pid = client.patient.id;
+
+        if (!pid) {
+          throw new Error("No patient context (launch/patient missing)");
+        }
+
+        document.getElementById("topStatus").textContent = "Connected";
+        document.getElementById("connectionStatus").textContent = "Connected";
+        document.getElementById("patientId").textContent = pid;
+        document.getElementById("observationId").textContent = OBS_ID;
+        document.getElementById("dataStatus").textContent = "Searching";
+
+        document.getElementById("info").textContent =
+          "✅ SMART OAuth Ready\n\n" +
+          "FHIR Server:\n" + fhirBase + "\n\n" +
+          "Selected Patient:\nPatient/" + pid + "\n\n" +
+          "Request:\n" +
+          `GET Observation?subject=Patient/${pid}&_id=${OBS_ID}\n\n` +
+          "Response:\n";
+
+        return client.request(
+          `Observation?subject=Patient/${pid}&_id=${OBS_ID}`
+        );
+      })
+      .then(bundle => {
+        if (!bundle.entry || bundle.entry.length === 0) {
+          throw new Error(
+            `Observation _id=${OBS_ID} not found under Patient/${pid}`
+          );
+        }
+
+        if (bundle.entry.length !== 1) {
+          throw new Error(
+            `Unexpected result: ${bundle.entry.length} Observations returned`
+          );
+        }
+
+        const obs = bundle.entry[0].resource;
+
+        if (obs.id !== OBS_ID) {
+          throw new Error("Returned Observation ID does not match requested _id");
+        }
+
+        if (obs.subject?.reference !== `Patient/${pid}`) {
+          throw new Error("Observation subject does not match selected patient");
+        }
+
+        OBS_URL = `${fhirBase}/Observation/${OBS_ID}`;
+
+        document.getElementById("dataStatus").textContent = "1";
+        document.getElementById("info").textContent +=
+          JSON.stringify(obs, null, 2) +
+          "\n\n✅ Confirmed Observation:\n" +
+          OBS_URL;
+      })
+      .catch(err => {
+        setError(err.message);
+        console.error("SMART Error:", err);
+      });
+
+    /**********************************************************
+     * 傳遞給 SHIELD APP
+     **********************************************************/
+    document.getElementById("go").onclick = () => {
+      if (!OBS_URL || !pid) {
+        alert("Observation not ready");
+        return;
+      }
+
+      const url =
+        SHINY_URL +
+        "?token=" + encodeURIComponent(accessToken) +
+        "&pid=" + encodeURIComponent(pid) +
+        "&obs=" + encodeURIComponent(OBS_URL) +
+        "&fhir=" + encodeURIComponent(fhirBase);
+
+      window.location.href = url;
+    };
+  </script>
+</body>
+</html>
